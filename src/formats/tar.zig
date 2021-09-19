@@ -162,7 +162,8 @@ pub const Header = struct {
         const header = self.asOld();
 
         const str = truncate(&header.mode);
-        return if (str.len == 0) 0 else try std.fmt.parseUnsigned(std.os.mode_t, str, 8);
+        const num = if (str.len == 0) 0 else try std.fmt.parseUnsigned(u24, str, 8);
+        return @truncate(std.os.mode_t, num);
     }
 
     pub fn entrySize(self: Header) !u64 {
@@ -185,7 +186,7 @@ pub const Header = struct {
         } else return try self.entrySize();
     }
 
-    pub fn preprocess(parser: *Parser, reader: anytype, strings: *usize, entries: *usize) !usize {
+    pub fn preprocess(parser: anytype, reader: anytype, strings: *usize, entries: *usize) !usize {
         var header = Header{
             .buffer = undefined,
         };
@@ -205,12 +206,12 @@ pub const Header = struct {
         }
 
         const total_data_len = try header.alignedEntrySize();
-        try parser.file.seekBy(@intCast(i64, total_data_len));
+        try parser.bufferedSeekBy(reader.context, @intCast(i64, total_data_len));
 
         return total_data_len + 512;
     }
 
-    pub fn parse(self: *Header, parser: *Parser, reader: anytype, offset: usize) !usize {
+    pub fn parse(self: *Header, parser: anytype, reader: anytype, offset: usize) !usize {
         const read = try reader.readAll(&self.buffer);
         if (read != 512) return error.InvalidHeader;
 
@@ -223,18 +224,18 @@ pub const Header = struct {
             .gnu_longname => {
                 const size = try self.entrySize();
 
-                parser.last_longname = truncate(try parser.readString(reader, size));
+                parser.last_longname = truncate(try parser.readFilename(reader, size));
                 parser.reuse_last_entry = true;
 
-                try parser.file.seekBy(@intCast(i64, total_data_len - size));
+                try parser.bufferedSeekBy(reader.context, @intCast(i64, total_data_len - size));
             },
             .gnu_longlink => {
                 const size = try self.entrySize();
 
-                parser.last_longlink = truncate(try parser.readString(reader, size));
+                parser.last_longlink = truncate(try parser.readFilename(reader, size));
                 parser.reuse_last_entry = true;
 
-                try parser.file.seekBy(@intCast(i64, total_data_len - size));
+                try parser.bufferedSeekBy(reader.context, @intCast(i64, total_data_len - size));
             },
             else => {
                 if (parser.last_longname) |name| {
@@ -253,7 +254,7 @@ pub const Header = struct {
                     self.longlink = null;
                 }
 
-                try parser.file.seekBy(@intCast(i64, total_data_len));
+                try parser.bufferedSeekBy(reader.context, @intCast(i64, total_data_len));
             },
         }
 
@@ -261,197 +262,158 @@ pub const Header = struct {
     }
 };
 
-pub const Parser = struct {
-    allocator: *std.mem.Allocator,
+pub fn Parser(comptime Reader: type) type {
+    return struct {
+        const Self = @This();
+        const ctx = utils.context(Self, Reader);
 
-    file: std.fs.File,
-    reader: std.fs.File.Reader,
+        usingnamespace ctx;
 
-    entries: std.ArrayListUnmanaged(Header) = .{},
-    string_buffer: std.ArrayListUnmanaged(u8) = .{},
+        allocator: *std.mem.Allocator,
 
-    reuse_last_entry: bool = false,
-    last_longname: ?[]const u8 = null,
-    last_longlink: ?[]const u8 = null,
+        reader: Reader,
 
-    pub fn init(allocator: *std.mem.Allocator, file: std.fs.File) Parser {
-        return .{
-            .allocator = allocator,
+        directory: std.ArrayListUnmanaged(Header) = .{},
+        filename_buffer: std.ArrayListUnmanaged(u8) = .{},
 
-            .file = file,
-            .reader = file.reader(),
-        };
-    }
+        reuse_last_entry: bool = false,
+        last_longname: ?[]const u8 = null,
+        last_longlink: ?[]const u8 = null,
 
-    pub fn deinit(self: *Parser) void {
-        self.entries.deinit(self.allocator);
-        self.string_buffer.deinit(self.allocator);
-    }
-
-    // TODO: update
-    /// Loads a tar file.
-    /// The best solution for loading with our file-tree system in mind seems to be a two-pass one:
-    /// - On the first (PreloadPass) pass, count the number of entries and total length of filenames so we can pre-allocate them
-    /// - On the second (LoadPass) pass, we can actually store things in our entries ArrayList
-    pub fn load(self: *Parser) !void {
-        var num_entries: usize = 0;
-        var num_strings: usize = 0;
-
-        const filesize = try self.file.getEndPos();
-        var pos: usize = 0;
-
-        while (pos < filesize) {
-            pos += try Header.preprocess(self, self.reader, &num_strings, &num_entries);
-        }
-
-        try self.entries.ensureTotalCapacity(self.allocator, num_entries);
-        try self.string_buffer.ensureTotalCapacity(self.allocator, num_strings);
-
-        try self.file.seekTo(0);
-        var index: usize = 0;
-        pos = 0;
-
-        while (index < num_entries) : (index += 1) {
-            var entry = blk: {
-                if (self.reuse_last_entry) {
-                    self.reuse_last_entry = false;
-                    index -= 1;
-
-                    break :blk &self.entries.items[self.entries.items.len - 1];
-                } else {
-                    break :blk self.entries.addOneAssumeCapacity();
-                }
+        pub fn init(allocator: *std.mem.Allocator, reader: Reader) Self {
+            return .{
+                .allocator = allocator,
+                .reader = reader,
             };
-
-            pos += try entry.parse(self, self.reader, pos);
         }
-    }
 
-    fn readString(self: *Parser, reader: anytype, len: usize) ![]const u8 {
-        if (len == 0) return "";
+        pub fn deinit(self: *Self) void {
+            self.directory.deinit(self.allocator);
+            self.filename_buffer.deinit(self.allocator);
+        }
 
-        try self.string_buffer.ensureUnusedCapacity(self.allocator, len);
-        const prev_len = self.string_buffer.items.len;
-        self.string_buffer.items.len += len;
+        pub fn load(self: *Self) !void {
+            var buffered = ctx.buffered(self);
+            const reader = buffered.reader();
 
-        var buf = self.string_buffer.items[prev_len..][0..len];
-        _ = try reader.readAll(buf);
+            var num_entries: usize = 0;
+            var num_strings: usize = 0;
 
-        return buf;
-    }
+            const filesize = try self.getEndPos();
+            var pos: usize = 0;
 
-    pub fn getFileIndex(self: Parser, filename: []const u8) !usize {
-        for (self.directory.items) |*hdr, i| {
-            if (std.mem.eql(u8, hdr.filename, filename)) {
-                return i;
+            while (pos < filesize) {
+                pos += try Header.preprocess(self, reader, &num_strings, &num_entries);
+            }
+
+            try self.directory.ensureTotalCapacity(self.allocator, num_entries);
+            try self.filename_buffer.ensureTotalCapacity(self.allocator, num_strings);
+
+            try self.bufferedSeekTo(reader.context, 0);
+            var index: usize = 0;
+            pos = 0;
+
+            while (index < num_entries) : (index += 1) {
+                var entry = blk: {
+                    if (self.reuse_last_entry) {
+                        self.reuse_last_entry = false;
+                        index -= 1;
+
+                        break :blk &self.directory.items[self.directory.items.len - 1];
+                    } else {
+                        break :blk self.directory.addOneAssumeCapacity();
+                    }
+                };
+
+                pos += try entry.parse(self, reader, pos);
             }
         }
 
-        return error.FileNotFound;
-    }
+        fn readFilename(self: *Self, reader: anytype, len: usize) ![]const u8 {
+            const prev_len = self.filename_buffer.items.len;
+            self.filename_buffer.items.len += len;
 
-    pub fn readFileAlloc(self: Parser, allocator: std.mem.Allocator, index: usize) ![]const u8 {
-        const header = self.directory[index];
+            var buf = self.filename_buffer.items[prev_len..][0..len];
+            _ = try reader.readAll(buf);
 
-        try self.seekTo(self.start_offset + header.local_header.offset);
-
-        var buffer = try allocator.alloc(header.uncompressed_size);
-        errdefer allocator.free(buffer);
-
-        var read_buffered = std.io.BufferedReader(8192, std.fs.File.Reader){ .unbuffered_reader = self.reader };
-        var limited_reader = utils.LimitedReader(std.io.BufferedReader(8192, std.fs.File.Reader).Reader).init(read_buffered.reader(), header.compressed_size);
-        const reader = limited_reader.reader();
-
-        var write_stream = std.io.fixedBufferStream(buffer);
-        const writer = write_stream.writer();
-
-        var fifo = std.fifo.LinearFifo(u8, .{ .Static = 8192 }).init();
-
-        switch (header.compression) {
-            .none => {
-                try fifo.pump(reader, writer);
-            },
-            .deflated => {
-                var window: [0x8000]u8 = undefined;
-                var stream = std.compress.deflate.inflateStream(reader, &window);
-
-                try fifo.pump(stream.reader(), writer);
-            },
-            else => return error.CompressionUnsupported,
+            return buf;
         }
-    }
 
-    pub const ExtractOptions = struct {
-        skip_components: u16 = 0,
-    };
+        pub fn getFileIndex(self: Self, filename: []const u8) !usize {
+            for (self.directory.items) |*hdr, i| {
+                if (std.mem.eql(u8, hdr.filename(), filename)) {
+                    return i;
+                }
+            }
 
-    pub fn extract(self: *Parser, dir: std.fs.Dir, options: ExtractOptions) !void {
-        try self.file.seekTo(0);
+            return error.FileNotFound;
+        }
 
-        var buffered = std.io.BufferedReader(8192, std.fs.File.Reader){ .unbuffered_reader = self.reader };
-        const reader = buffered.reader();
-
-        var buffer: [8192]u8 = undefined;
-
-        var index: usize = 0;
-        extract: while (index < self.entries.items.len) : (index += 1) {
+        pub fn readFileAlloc(self: *Self, allocator: std.mem.Allocator, index: usize) ![]const u8 {
             const header = self.entries.items[index];
 
-            const full_filename = header.filename();
             const entry_size = try header.entrySize();
-            const aligned_entry_size = try header.alignedEntrySize();
 
-            const new_filename = blk: {
-                var component: usize = 0;
-                var last_pos: usize = 0;
-                while (component < options.skip_components) : (component += 1) {
-                    last_pos = std.mem.indexOfPos(u8, full_filename, last_pos, "/") orelse {
-                        try reader.skipBytes(aligned_entry_size, .{ .buf_size = 4096 });
-                        continue :extract;
-                    };
-                }
+            try self.seekTo(header.offset + 512);
 
-                if (last_pos + 1 == full_filename.len) continue :extract;
+            var buffer = try allocator.alloc(u8, entry_size);
+            errdefer allocator.free(buffer);
 
-                break :blk full_filename[last_pos + 1 ..];
-            };
+            var buffered_read = ctx.buffered(self);
+            var limited_reader = ctx.limited(buffered_read.reader(), entry_size);
+            const reader = limited_reader.reader();
+
+            var write_stream = std.io.fixedBufferStream(buffer);
+            const writer = write_stream.writer();
+
+            var fifo = std.fifo.LinearFifo(u8, .{ .Static = 8192 }).init();
 
             switch (header.kind()) {
                 .aregular, .regular => {
-                    const dirname = std.fs.path.dirname(new_filename);
-                    if (dirname) |name| try dir.makePath(name);
-
-                    const fd = try dir.createFile(new_filename, .{ .mode = try header.mode() });
-                    defer fd.close();
-
-                    const writer = fd.writer();
-
-                    var size_read: usize = 0;
-                    while (size_read < entry_size) {
-                        const needed = std.math.min(buffer.len, entry_size - size_read);
-
-                        const read = try reader.readAll(buffer[0..needed]);
-                        if (read == 0) return error.Unknown;
-
-                        size_read += read;
-
-                        try writer.writeAll(buffer[0..read]);
-                    }
-
-                    try reader.skipBytes(aligned_entry_size - entry_size, .{ .buf_size = 4096 });
-                    continue;
+                    try fifo.pump(reader, writer);
                 },
-                .directory => {
-                    try dir.makePath(new_filename);
-
-                    try reader.skipBytes(aligned_entry_size, .{ .buf_size = 4096 });
-                    continue;
-                },
-                else => {
-                    try reader.skipBytes(aligned_entry_size, .{ .buf_size = 4096 });
-                    continue;
-                },
+                .directory => return error.IsDir,
+                else => return error.NotAFile,
             }
         }
-    }
-};
+
+        pub const ExtractOptions = struct {
+            skip_components: u16 = 0,
+        };
+
+        pub fn extract(self: *Self, dir: std.fs.Dir, options: ExtractOptions) !usize {
+            var buffered = ctx.buffered(self);
+            const file_reader = buffered.reader();
+
+            var written: usize = 0;
+
+            for (self.directory.items) |hdr| {
+                const new_filename = utils.stripPathComponents(hdr.filename(), options.skip_components) orelse continue;
+
+                switch (hdr.kind()) {
+                    .aregular, .regular => {
+                        if (std.fs.path.dirnamePosix(new_filename)) |name| try dir.makePath(name);
+
+                        const fd = try dir.createFile(new_filename, .{ .mode = try hdr.mode() });
+                        defer fd.close();
+
+                        try self.bufferedSeekTo(file_reader.context, hdr.offset + 512);
+
+                        var limited_reader = ctx.limited(file_reader, try hdr.entrySize());
+                        const reader = limited_reader.reader();
+
+                        var fifo = std.fifo.LinearFifo(u8, .{ .Static = 8192 }).init();
+
+                        written += try hdr.entrySize();
+
+                        try fifo.pump(reader, fd.writer());
+                    },
+                    .directory => try dir.makePath(new_filename),
+                    else => {},
+                }
+            }
+
+            return written;
+        }
+    };
+}

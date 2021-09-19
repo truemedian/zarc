@@ -43,12 +43,12 @@ pub fn main() !void {
 
         const size = try archive_file.getEndPos();
 
-        var timer = try std.time.Timer.start();
         var archive = zarc.zip.Parser(std.fs.File.Reader).init(allocator, archive_file.reader());
         defer archive.deinit();
 
         try writer.print("File: {s}\n", .{entry.name});
 
+        var timer = try std.time.Timer.start();
         try archive.load();
         const time = timer.read();
 
@@ -66,14 +66,14 @@ pub fn main() !void {
 
         // try printFileTree(writer, try archive.getFileTree());
 
-        // const start = timer.read();
-        // const total_written = try archive.extract(extract_dir, .{ .skip_components = 1 });
-        // const stop = timer.read();
+        const start = timer.read();
+        const total_written = try archive.extract(extract_dir, .{ .skip_components = 1 });
+        const stop = timer.read();
 
-        // const extract_time = @intToFloat(f64, stop - start) / 1e9;
-        // const extract_speed = @intToFloat(f64, total_written) / extract_time;
-        // try writer.print("Extract Size: {d}\n", .{total_written});
-        // try writer.print("Extract Speed: {d:.3} MB/s\n", .{extract_speed / 1e6});
+        const extract_time = @intToFloat(f64, stop - start) / 1e9;
+        const extract_speed = @intToFloat(f64, total_written) / extract_time;
+        try writer.print("Extract Size: {d}\n", .{total_written});
+        try writer.print("Extract Speed: {d:.3} MB/s\n", .{extract_speed / 1e6});
 
         try writer.writeAll("\n-----\n\n");
     }

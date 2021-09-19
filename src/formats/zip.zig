@@ -475,16 +475,11 @@ pub const EndCentralDirectoryRecord = struct {
 };
 
 pub fn Parser(comptime Reader: type) type {
-    const BufferedReader = std.io.BufferedReader(8192, Reader);
-    // const ReadError = Reader.Error;
-
-    const ReaderContext = std.meta.fieldInfo(Reader, .context).field_type;
-    const isSeekable = @hasDecl(ReaderContext, "seekBy") and @hasDecl(ReaderContext, "seekTo") and @hasDecl(ReaderContext, "getEndPos");
-
-    if (!isSeekable) @compileError("Reader must wrap a seekable context");
-
     return struct {
         const Self = @This();
+        const ctx = utils.context(Self, Reader);
+
+        usingnamespace ctx;
 
         allocator: *std.mem.Allocator,
 
@@ -520,7 +515,7 @@ pub fn Parser(comptime Reader: type) type {
             try self.readDirectory();
         }
 
-        const SearchError = Reader.Error || ReaderContext.SeekError || error{ EndOfStream, FileTooSmall, InvalidZip, InvalidZip64Locator, MultidiskUnsupported, TooManyFiles };
+        const SearchError = Reader.Error || ctx.ReaderContext.SeekError || error{ EndOfStream, FileTooSmall, InvalidZip, InvalidZip64Locator, MultidiskUnsupported, TooManyFiles };
         fn search(self: *Self) SearchError!void {
             const file_length = try self.reader.context.getEndPos();
             const minimum_ecdr_offset: u64 = EndCentralDirectoryRecord.size + 4;
@@ -607,14 +602,14 @@ pub fn Parser(comptime Reader: type) type {
             return lhs.offset < rhs.offset;
         }
 
-        const ReadDirectoryError = std.mem.Allocator.Error || Reader.Error || ReaderContext.SeekError || CentralDirectoryHeader.ReadInitialError || CentralDirectoryHeader.ReadSecondaryError || CentralDirectoryHeader.ReadLocalError || error{ EndOfStream, MalformedCentralDirectoryHeader };
+        const ReadDirectoryError = std.mem.Allocator.Error || Reader.Error || ctx.ReaderContext.SeekError || CentralDirectoryHeader.ReadInitialError || CentralDirectoryHeader.ReadSecondaryError || CentralDirectoryHeader.ReadLocalError || error{ EndOfStream, MalformedCentralDirectoryHeader };
         fn readDirectory(self: *Self) ReadDirectoryError!void {
             try self.directory.ensureTotalCapacity(self.allocator, self.num_entries);
 
             var index: u32 = 0;
             try self.seekTo(self.start_offset + self.directory_offset);
 
-            var buffered = BufferedReader{ .unbuffered_reader = self.reader };
+            var buffered = ctx.buffered(self);
             const reader = buffered.reader();
 
             var filename_len_total: usize = 0;
@@ -661,8 +656,8 @@ pub fn Parser(comptime Reader: type) type {
             var buffer = try allocator.alloc(u8, header.uncompressed_size);
             errdefer allocator.free(buffer);
 
-            var read_buffered = BufferedReader{ .unbuffered_reader = self.reader };
-            var limited_reader = utils.LimitedReader(BufferedReader.Reader).init(read_buffered.reader(), header.compressed_size);
+            var buffered_read = ctx.buffered(self);
+            var limited_reader = ctx.limited(buffered_read.reader(), header.compressed_size);
             const reader = limited_reader.reader();
 
             var write_stream = std.io.fixedBufferStream(buffer);
@@ -691,23 +686,13 @@ pub fn Parser(comptime Reader: type) type {
         };
 
         pub fn extract(self: *Self, dir: std.fs.Dir, options: ExtractOptions) !usize {
-            var buffered = BufferedReader{ .unbuffered_reader = self.reader };
+            var buffered = ctx.buffered(self);
             const file_reader = buffered.reader();
 
             var written: usize = 0;
 
-            extract: for (self.directory.items) |hdr| {
-                const new_filename = blk: {
-                    var component: usize = 0;
-                    var last_pos: usize = 0;
-                    while (component < options.skip_components) : (component += 1) {
-                        last_pos = std.mem.indexOfPos(u8, hdr.filename, last_pos, "/") orelse continue :extract;
-                    }
-
-                    if (last_pos + 1 == hdr.filename_len) continue :extract;
-
-                    break :blk hdr.filename[last_pos + 1 ..];
-                };
+            for (self.directory.items) |hdr| {
+                const new_filename = utils.stripPathComponents(hdr.filename, options.skip_components) orelse continue;
 
                 if (std.fs.path.dirnamePosix(new_filename)) |dirname| {
                     try dir.makePath(dirname);
@@ -720,7 +705,7 @@ pub fn Parser(comptime Reader: type) type {
 
                 try self.bufferedSeekTo(file_reader.context, self.start_offset + hdr.local_header.offset);
 
-                var limited_reader = utils.LimitedReader(BufferedReader.Reader).init(file_reader, hdr.compressed_size);
+                var limited_reader = ctx.limited(file_reader, hdr.compressed_size);
                 const reader = limited_reader.reader();
 
                 var fifo = std.fifo.LinearFifo(u8, .{ .Static = 8192 }).init();
@@ -765,53 +750,6 @@ pub fn Parser(comptime Reader: type) type {
             _ = try reader.readAll(buf);
 
             return buf;
-        }
-
-        fn seekTo(self: *Self, offset: u64) !void {
-            try self.reader.context.seekTo(offset);
-        }
-
-        fn seekBy(self: *Self, offset: i64) !void {
-            try self.reader.context.seekBy(offset);
-        }
-
-        fn bufferedSeekBy(self: *Self, buffered: *BufferedReader, offset: i64) !void {
-            if (offset == 0) return;
-
-            if (offset > 0) {
-                const u_offset = @intCast(u64, offset);
-
-                if (u_offset <= buffered.fifo.count) {
-                    buffered.fifo.discard(u_offset);
-                } else if (u_offset <= buffered.fifo.count + buffered.fifo.buf.len) {
-                    const left = u_offset - buffered.fifo.count;
-
-                    buffered.fifo.discard(buffered.fifo.count);
-                    try buffered.reader().skipBytes(left, .{ .buf_size = 8192 });
-                } else {
-                    const left = u_offset - buffered.fifo.count;
-
-                    buffered.fifo.discard(buffered.fifo.count);
-                    try self.seekBy(@intCast(i64, left));
-                }
-            } else {
-                const left = offset - @intCast(i64, buffered.fifo.count);
-
-                buffered.fifo.discard(buffered.fifo.count);
-                try self.seekBy(left);
-            }
-        }
-
-        fn bufferedGetPos(self: *Self, buffered: *BufferedReader) !u64 {
-            const pos = try self.reader.context.getPos();
-
-            return pos - buffered.fifo.count;
-        }
-
-        fn bufferedSeekTo(self: *Self, buffered: *BufferedReader, pos: u64) !void {
-            const offset = @intCast(i64, pos) - @intCast(i64, try self.bufferedGetPos(buffered));
-
-            try self.bufferedSeekBy(buffered, offset);
         }
     };
 }

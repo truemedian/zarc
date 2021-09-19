@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub const simd = @import("utils/simd.zig");
+pub const context = @import("utils/context.zig").mixin;
 
 pub fn readStruct(comptime T: type, instance: *T, reader: anytype, comptime expected_size: usize) !void {
     const fields = std.meta.fields(T);
@@ -81,4 +82,21 @@ pub fn LimitedReader(comptime ReaderType: type) type {
             return .{ .context = self };
         }
     };
+}
+
+pub fn stripPathComponents(path: []const u8, num_components: usize) ?[]const u8 {
+    if (path.len == 0) return null;
+
+    var component: usize = 0;
+    var pos: usize = 0;
+
+    if (path[0] == '/') pos = 1;
+    while (component < num_components) : (component += 1) {
+        const next_pos = std.mem.indexOfScalarPos(u8, path, pos, '/') orelse return null;
+        pos = next_pos + 1;
+    }
+
+    if (pos == path.len) return null;
+
+    return path[pos..];
 }
