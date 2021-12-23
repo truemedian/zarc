@@ -9,8 +9,7 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
 pub fn ArchiveReader(comptime Reader: type) type {
-    const Seek = common.Seeker(Reader);
-    const LimitedReader = common.LimitedReader(Seek.BufferedReader.Reader);
+    const LimitedReader = common.LimitedReader(Reader);
 
     return struct {
         const Self = @This();
@@ -60,13 +59,10 @@ pub fn ArchiveReader(comptime Reader: type) type {
         fn preprocess(self: *Self) !void {
             var entry: tar.Entry = .{ .header = undefined };
 
-            var buffered = Seek.BufferedReader{ .unbuffered_reader = self.reader };
-            const reader = buffered.reader();
-
             var result = PreprocessResult{};
 
             while (true) {
-                const num_read = try reader.readAll(&entry.header.any);
+                const num_read = try self.reader.readAll(&entry.header.any);
                 if (num_read != 512) return error.EndOfStream;
 
                 if (std.mem.allEqual(u8, &entry.header.any, 0)) {
@@ -90,7 +86,7 @@ pub fn ArchiveReader(comptime Reader: type) type {
                     },
                 }
 
-                try Seek.seekBy(self.reader, &buffered, @intCast(i64, aligned_len));
+                try self.reader.context.seekBy(@intCast(i64, aligned_len));
             }
 
             // Reset the reader to the start of the stream.
@@ -109,9 +105,6 @@ pub fn ArchiveReader(comptime Reader: type) type {
             // Who are we kidding, this will probably be a file.
             var stream_pos: usize = 0;
 
-            var buffered = Seek.BufferedReader{ .unbuffered_reader = self.reader };
-            const reader = buffered.reader();
-
             while (true) {
                 var entry: *tar.Entry = undefined;
 
@@ -127,7 +120,7 @@ pub fn ArchiveReader(comptime Reader: type) type {
                 self.reuse_entry = false;
                 entry.stream_offset = stream_pos;
 
-                const num_read = try reader.readAll(&entry.header.any);
+                const num_read = try self.reader.readAll(&entry.header.any);
                 if (num_read != 512) return error.EndOfStream;
 
                 if (std.mem.allEqual(u8, &entry.header.any, 0)) {
@@ -142,52 +135,56 @@ pub fn ArchiveReader(comptime Reader: type) type {
 
                 switch (entry.header.unix7.typeflag) {
                     .pax_global => {
-                        var limited_reader = LimitedReader.init(reader, len);
+                        var limited_reader = LimitedReader.init(self.reader, len);
                         try self.global_pax.parse(self.allocator, string_allocator, limited_reader.reader());
-                        
+
                         self.reuse_entry = true;
 
-                        try Seek.seekBy(self.reader, &buffered, @intCast(i64, aligned_len - len));
+                        try self.reader.context.seekBy(@intCast(i64, aligned_len - len));
                     },
-                    .pax_local => {
-                        var limited_reader = LimitedReader.init(reader, len);
+                    .pax_local, .solaris_extension => {
+                        var limited_reader = LimitedReader.init(self.reader, len);
                         try entry.pax_ext.parse(self.allocator, string_allocator, limited_reader.reader());
 
                         self.reuse_entry = true;
 
-                        try Seek.seekBy(self.reader, &buffered, @intCast(i64, aligned_len - len));
+                        try self.reader.context.seekBy(@intCast(i64, aligned_len - len));
                     },
                     .gnu_long_link => {
                         const actual_len = len - 1;
                         const buffer = try string_allocator.alloc(u8, actual_len);
 
-                        const num_read_field = try reader.readAll(buffer);
+                        const num_read_field = try self.reader.readAll(buffer);
                         if (num_read_field != actual_len) return error.EndOfStream;
 
                         entry.gnu_long_link = buffer;
                         self.reuse_entry = true;
 
-                        try Seek.seekBy(self.reader, &buffered, @intCast(i64, aligned_len - actual_len));
+                        try self.reader.context.seekBy(@intCast(i64, aligned_len - actual_len));
                     },
                     .gnu_long_name => {
                         const actual_len = len - 1;
                         const buffer = try string_allocator.alloc(u8, actual_len);
 
-                        const num_read_field = try reader.readAll(buffer);
+                        const num_read_field = try self.reader.readAll(buffer);
                         if (num_read_field != actual_len) return error.EndOfStream;
 
                         entry.gnu_long_name = buffer;
                         self.reuse_entry = true;
 
-                        try Seek.seekBy(self.reader, &buffered, @intCast(i64, aligned_len - actual_len));
+                        try self.reader.context.seekBy(@intCast(i64, aligned_len - actual_len));
                     },
                     else => {
-                        try Seek.seekBy(self.reader, &buffered, @intCast(i64, aligned_len));
+                        if (len > 0) try self.reader.context.seekBy(@intCast(i64, aligned_len));
                     },
                 }
             }
 
             if (self.reuse_entry) return error.MalformedArchive;
+        }
+
+        pub fn getEntry(self: *Self, index: usize) *const tar.Entry {
+            return &self.entries.items[index];
         }
     };
 }
