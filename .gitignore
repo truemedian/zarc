@@ -1,0 +1,9 @@
+/zig-cache
+/zig-out
+
+*.zip
+*.jmod
+*.tar
+*.exe
+
+*.txt
