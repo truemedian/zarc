@@ -186,5 +186,100 @@ pub fn ArchiveReader(comptime Reader: type) type {
         pub fn getEntry(self: *Self, index: usize) *const tar.Entry {
             return &self.entries.items[index];
         }
+
+        pub fn extractSingle(self: Self, writer: anytype, index: usize) []const u8 {
+            const entry = self.entries.items[index];
+
+            const len = try entry.getSize();
+
+            try self.reader.context.seekTo(entry.stream_offset + 512);
+
+            var buffer: [8096]u8 = undefined;
+            var pos: usize = 0;
+
+            while (pos < len) {
+                const left = std.math.min(len - pos, buffer.len);
+                const num_read = try self.reader.read(buffer[0..left]);
+                if (num_read == 0) return error.EndOfStream;
+
+                try writer.writeAll(buffer[0..num_read]);
+                pos += num_read;
+            }
+
+            return len;
+        }
+
+        pub fn extractSingleAlloc(self: Self, allocator: Allocator, index: usize) []const u8 {
+            const entry = self.entries.items[index];
+
+            const len = try entry.getSize();
+            const buffer = try allocator.alloc(u8, len);
+
+            try self.reader.context.seekTo(entry.stream_offset + 512);
+            const num_read = try self.reader.readAll(buffer);
+            if (num_read != len) return error.EndOfStream;
+
+            return buffer;
+        }
+
+        pub const ExtractDirectoryOptions = struct {
+            skip_components: usize = 0,
+        };
+
+        pub fn extractToDirectory(self: Self, allocator: Allocator, options: ExtractDirectoryOptions, dir: std.fs.Dir) !void {
+            var buffer: [8096]u8 = undefined;
+
+            for (self.entries.items) |entry| {
+                const name = try allocator.alloc(u8, entry.getNameLen());
+                defer allocator.free(name);
+
+                var actual_name: []const u8 = entry.getName(name);
+
+                if (options.skip_components > 0) {
+                    var component_it = std.mem.split(u8, actual_name, "/");
+
+                    var i = options.skip_components;
+                    while (i > 0) : (i -= 1) {
+                        _ = component_it.next() orelse continue;
+                    }
+
+                    actual_name = component_it.rest();
+                }
+
+                switch (entry.header.unix7.typeflag) {
+                    .directory => {
+                        try dir.makePath(actual_name);
+                    },
+                    else => {
+                        if (actual_name[actual_name.len - 1] == '/') {
+                            try dir.makePath(actual_name);
+                            continue;
+                        } else if (std.fs.path.dirnamePosix(actual_name)) |dirname| {
+                            try dir.makePath(dirname);
+                        }
+
+                        const file = try dir.createFile(actual_name, .{});
+                        defer file.close();
+
+                        const len = try entry.getSize();
+
+                        try self.reader.context.seekTo(entry.stream_offset + 512);
+                        var pos: usize = 0;
+
+                        const writer = file.writer();
+                        try file.setEndPos(len);
+
+                        while (pos < len) {
+                            const left = std.math.min(len - pos, buffer.len);
+                            const num_read = try self.reader.read(buffer[0..left]);
+                            if (num_read == 0) return error.EndOfStream;
+
+                            try writer.writeAll(buffer[0..num_read]);
+                            pos += num_read;
+                        }
+                    },
+                }
+            }
+        }
     };
 }

@@ -7,6 +7,9 @@ pub fn main() !void {
     var tests_dir = try std.fs.cwd().openDir("tests/tar", .{ .iterate = true });
     defer tests_dir.close();
 
+    var extract_dir = try std.fs.cwd().makeOpenPath("tests/extract", .{});
+    defer extract_dir.close();
+
     var report = try std.fs.cwd().createFile("tests/tar.report.txt", .{});
     defer report.close();
 
@@ -32,12 +35,14 @@ pub fn main() !void {
         try writer.print("Entries: {d} ({d})\n", .{ archive.entries.items.len, archive.entries.items.len * @sizeOf(zarc.format.tar.Entry) });
         try writer.print("Strings Size: {d}\n", .{archive.string_buffer.len});
 
-        for (archive.entries.items) |hdr| {
-            const buffer = try allocator.alloc(u8, hdr.getNameLen());
-            const name = hdr.getName(buffer);
+        var new_extract_dir = try extract_dir.makeOpenPath(entry.name, .{});
+        defer new_extract_dir.close();
 
-            try writer.print("{} {s} {d}\n", .{ hdr.header.unix7.typeflag, name, try hdr.getSize() });
-        }
+        timer.reset();
+        try archive.extractToDirectory(allocator, .{}, new_extract_dir);
+        const time_extract = timer.read();
+
+        try writer.print("Extract Time: {d:.3}ms\n\n", .{@intToFloat(f64, time_extract) / 1e6});
 
         try writer.writeAll("\n\n-----\n\n");
     }
